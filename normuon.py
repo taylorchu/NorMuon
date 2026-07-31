@@ -32,19 +32,63 @@ def zeropower_via_newtonschulz5(G, steps=5):
 
 
 
-def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True):
+def split_heads(matrix, num_heads, head_axis):
+    """
+    View a 2D attention projection as num_heads independent blocks, so that a batched Newton-Schulz
+    orthogonalizes each head on its own instead of coupling every head through one polar factor.
+    head_axis is "row" when out_features is num_heads * head_dim, as for the query/key/value
+    projections, and "col" when in_features is, as for the output projection.
+    """
+    assert matrix.ndim == 2, "per-head splitting expects a 2D attention projection"
+    rows, cols = matrix.shape
+    if head_axis == "row":
+        assert rows % num_heads == 0, f"out_features {rows} is not divisible by num_heads {num_heads}"
+        return matrix.unflatten(0, (num_heads, -1))
+
+    assert head_axis == "col", f"head_axis must be 'row' or 'col', got {head_axis!r}"
+    assert cols % num_heads == 0, f"in_features {cols} is not divisible by num_heads {num_heads}"
+    return matrix.unflatten(1, (num_heads, -1)).transpose(0, 1)
+
+
+def merge_heads(blocks, head_axis):
+    if head_axis == "row":
+        return blocks.flatten(0, 1)
+
+    return blocks.transpose(0, 1).flatten(1, 2)
+
+
+def second_momentum_buffer(param, num_heads, head_axis):
+    if num_heads is None:
+        return torch.zeros_like(param[..., 0:1])
+
+    return param.new_zeros(split_heads(param, num_heads, head_axis)[..., 0:1].shape)
+
+
+def head_config(group):
+    # load_state_dict overwrites a group with the saved one, which for a checkpoint predating
+    # per-head Muon carries no head keys at all.
+    return group.get("num_heads"), group.get("head_axis", "row")
+
+
+def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True,
+                   num_heads=None, head_axis="row"):
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
     original_shape = None
     if update.ndim == 4:  # for the case of conv filters
+        assert num_heads is None, "per-head splitting does not apply to conv filters"
         original_shape = update.shape
         update = update.reshape(update.size(0), -1)
+
+    if num_heads is not None:
+        update = split_heads(update, num_heads, head_axis)
     update = zeropower_via_newtonschulz5(update, steps=ns_steps)
     update = update.to(grad.dtype)
 
     if original_shape is not None:
         update = update.reshape(original_shape)
     ################ NorMuon added ###################
+    # With the heads split, dim=(-2,-1) spans one head, so the norm restoration below is per-head.
     vnorm = update.norm(dim=(-2,-1), keepdim=True)
     v_mean = torch.mean(update * update, dim=-1, keepdim=True)
     second_momentum.lerp_(v_mean, 1 - beta2)
@@ -53,7 +97,11 @@ def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_st
     vnorm_new = update.norm(dim=(-2,-1), keepdim=True)
     update.mul_(vnorm / (vnorm_new.add_(1e-10))) # This scaling keep the update norm the same as pre-normalization
     ##################################################
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    # Shape of whatever was orthogonalized, which with the heads split is one head's block. That
+    # keeps a row-split update at the same Frobenius norm as a fused one, so lr carries over.
+    update *= max(1, update.size(-2) / update.size(-1))**0.5
+    if num_heads is not None:
+        update = merge_heads(update, head_axis)
     return update
 
 
@@ -100,8 +148,9 @@ class SingleDeviceNorMuon(torch.optim.Optimizer):
     """
     Muon variant for usage in non-distributed settings.
     """
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95, beta2=0.95):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95, beta2=0.95, num_heads=None, head_axis="row"):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2, num_heads=num_heads,
+                        head_axis=head_axis)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -113,6 +162,7 @@ class SingleDeviceNorMuon(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
+            num_heads, head_axis = head_config(group)
             for p in group["params"]:
                 had_grad = p.grad is not None
                 if not had_grad:
@@ -121,8 +171,10 @@ class SingleDeviceNorMuon(torch.optim.Optimizer):
                 state = self.state[p]
                 if len(state) == 0:
                     state["momentum_buffer"] = torch.zeros_like(p)
-                    state["second_momentum_buffer"] = torch.zeros_like(p[...,0:1])
-                update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"], beta=group["momentum"], beta2=group["beta2"])
+                    state["second_momentum_buffer"] = second_momentum_buffer(p, num_heads, head_axis)
+                update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
+                                        beta=group["momentum"], beta2=group["beta2"],
+                                        num_heads=num_heads, head_axis=head_axis)
                 if group["weight_decay"] and had_grad:
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                 p.add_(update.reshape(p.shape), alpha=-group["lr"])
@@ -221,7 +273,10 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["momentum"] = group.get("momentum", 0.95)
                 group["beta2"] = group.get("beta2", 0.95)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "momentum", "beta2", "weight_decay", "use_muon"}
+                group["num_heads"] = group.get("num_heads", None)
+                group["head_axis"] = group.get("head_axis", "row")
+                assert set(group.keys()) == {"params", "lr", "momentum", "beta2", "weight_decay", "use_muon",
+                                             "num_heads", "head_axis"}
             else:
                 group["lr"] = group.get("lr", 3e-4)
                 group["betas"] = group.get("betas", (0.9, 0.95))
@@ -240,6 +295,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
 
         for group in self.param_groups:
             if group["use_muon"]:
+                num_heads, head_axis = head_config(group)
                 for p in group["params"]:
                     had_grad = p.grad is not None
                     if not had_grad:
@@ -247,9 +303,10 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
-                        state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
+                        state["second_momentum_buffer"] = second_momentum_buffer(p, num_heads, head_axis)
                     update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
-                                            beta=group["momentum"], beta2=group["beta2"])
+                                            beta=group["momentum"], beta2=group["beta2"],
+                                            num_heads=num_heads, head_axis=head_axis)
                     if group["weight_decay"] and had_grad:
                         p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])
