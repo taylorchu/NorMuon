@@ -327,6 +327,53 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
         return loss
 
 
+def fp32_accumulator(state, p):
+    """The fp32 shadow an update is applied to, for a parameter held in lower precision.
+
+    bf16 keeps 7 mantissa bits, so a parameter at 0.125 has a ULP of 9.8e-4 and rounds any update
+    below half of that straight back to itself. Under a 4e-4 Adam step every zero-centered RMSNorm
+    gain in a bf16 model therefore climbs to exactly 0.125 and stops, and parameters at 1.0 -- a
+    gated norm's init, dt_bias -- never move at all: measured across four runs, whose dt_bias was
+    bit-identical at 1.00 under different seeds. Weight decay is lost the same way, being smaller
+    still. Accumulating in fp32 and rounding into the parameter is what lets increments below an
+    ULP add up to one, at 4 bytes per parameter. Kahan summation (arXiv 2010.06192, and torchdistx's
+    AnyPrecisionAdamW) buys the same thing for 2, and measures at least as well; it is the move if
+    the 4 bytes ever bind, which on one 96GB card they do not.
+
+    Returns p itself when p is already fp32, so those parameters keep their exact prior behavior.
+    The other optimizers here share the flaw and are deliberately left alone: this is the one that
+    is exercised, and an untested change to a code path is worse than a known one.
+
+    Momentum buffers stay in the parameter's dtype on purpose. A decaying average of gradients is
+    transient and tracks the gradient's own scale, unlike a parameter, which is a running sum where
+    a dropped increment never comes back. Holding momentum in fp32 would cost as much as the model.
+    """
+    if p.dtype == torch.float32:
+        return p
+    master = state.get("master")
+    if master is None:
+        master = state["master"] = p.detach().float().clone()
+    return master
+
+
+def restore_fp32_state(optimizer, state_dict):
+    """Undo Optimizer.load_state_dict's cast of float state to the parameter dtype.
+
+    That cast (_process_value_according_to_param_policy) assumes every floating-point state tensor
+    matches its parameter's dtype, which for a bf16 parameter downcasts the accumulator above and
+    silently reinstates the stall it exists to prevent. The id -> parameter mapping is built the way
+    load_state_dict builds its own.
+    """
+    saved_ids = [pid for group in state_dict["param_groups"] for pid in group["params"]]
+    params = [p for group in optimizer.param_groups for p in group["params"]]
+    id_map = dict(zip(saved_ids, params))
+    for pid, saved in state_dict["state"].items():
+        master = saved.get("master")
+        if master is not None:
+            p = id_map[pid]
+            optimizer.state[p]["master"] = master.detach().clone().to(device=p.device)
+
+
 class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
     """
     Non-distributed counterpart to NorMuonWithAuxAdam.
@@ -351,6 +398,10 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_muon"}
         super().__init__(param_groups, dict())
 
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        restore_fp32_state(self, state_dict)
+
     @torch.no_grad()
     def step(self, closure=None):
 
@@ -373,9 +424,12 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                     update = normuon_update(p.grad, state["momentum_buffer"], state["second_momentum_buffer"],
                                             beta=group["momentum"], beta2=group["beta2"],
                                             num_heads=num_heads, head_axis=head_axis)
+                    target = fp32_accumulator(state, p)
                     if group["weight_decay"] and had_grad:
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                        target.mul_(1 - group["lr"] * group["weight_decay"])
+                    target.add_(update.reshape(p.shape), alpha=-group["lr"])
+                    if target is not p:
+                        p.copy_(target)
             else:
                 for p in group["params"]:
                     had_grad = p.grad is not None
@@ -389,8 +443,11 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                     state["step"] += 1
                     update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
                                          state["step"], group["betas"], group["eps"])
+                    target = fp32_accumulator(state, p)
                     if group["weight_decay"] and had_grad:
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
+                        target.mul_(1 - group["lr"] * group["weight_decay"])
+                    target.add_(update, alpha=-group["lr"])
+                    if target is not p:
+                        p.copy_(target)
 
         return loss
