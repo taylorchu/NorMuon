@@ -126,6 +126,39 @@ def head_config(group):
     return group.get("num_heads"), group.get("head_axis", "row")
 
 
+def hyperball_step(p, update, lr, state, num_heads=None, head_axis="row"):
+    """Step along the update, then project the weight back onto the sphere it started on.
+
+    Hyperball, from "Fantastic Pretraining Optimizers and Where to Find Them II" (arXiv 2606.16899):
+    W <- R * Normalize(W - lr * R * Normalize(u)), Frobenius throughout, R fixed for the run at the
+    initial weight norm. Weight and step then share units, so lr is the fraction of the radius
+    travelled per step rather than a step in whatever scale the base update happens to carry.
+
+    The sphere is per head wherever the update is, one radius per block rather than one for the
+    matrix. A single radius pins only the sum of squares, which lets one head grow at another's
+    expense -- exactly the coupling between heads that splitting them exists to remove. Per block,
+    NorMuon's norm restoration no longer sets the relative size of the heads, since each is pinned to
+    its own radius; what survives of it is the direction its per-row rescaling picks inside a block.
+
+    Weight decay is dropped rather than ignored: scaling W by c before a step of fixed norm and then
+    renormalizing lands exactly where stepping with lr / c does, so under the projection decay is
+    only a learning rate in disguise.
+    """
+    if num_heads is None:
+        dims = tuple(range(p.ndim))
+    else:
+        p, update, dims = split_heads(p, num_heads, head_axis), split_heads(update, num_heads, head_axis), (-2, -1)
+
+    def norm(x):
+        return x.norm(dim=dims, keepdim=True, dtype=torch.float32).add(1e-10)
+
+    radius = state.get("radius")
+    if radius is None:
+        radius = state["radius"] = p.norm(dim=dims, keepdim=True, dtype=torch.float32)
+    p.sub_(update * (lr * radius / norm(update)))
+    p.mul_(radius / norm(p))
+
+
 def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=8, nesterov=True,
                    num_heads=None, head_axis="row"):
     """8 Polar Express steps replace 5 of the fixed-coefficient quintic. The quintic's spread is not
@@ -361,17 +394,20 @@ def restore_fp32_state(optimizer, state_dict):
 
     That cast (_process_value_according_to_param_policy) assumes every floating-point state tensor
     matches its parameter's dtype, which for a bf16 parameter downcasts the accumulator above and
-    silently reinstates the stall it exists to prevent. The id -> parameter mapping is built the way
-    load_state_dict builds its own.
+    silently reinstates the stall it exists to prevent. The hyperball radius needs the same
+    exemption: rounded to bf16 it moves the sphere by up to 0.4% on resume, which is a weight rescale
+    the run never asked for. The id -> parameter mapping is built the way load_state_dict builds its
+    own.
     """
     saved_ids = [pid for group in state_dict["param_groups"] for pid in group["params"]]
     params = [p for group in optimizer.param_groups for p in group["params"]]
     id_map = dict(zip(saved_ids, params))
     for pid, saved in state_dict["state"].items():
-        master = saved.get("master")
-        if master is not None:
-            p = id_map[pid]
-            optimizer.state[p]["master"] = master.detach().clone().to(device=p.device)
+        for key in ("master", "radius"):
+            value = saved.get(key)
+            if value is not None:
+                p = id_map[pid]
+                optimizer.state[p][key] = value.detach().clone().to(device=p.device)
 
 
 class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
@@ -425,9 +461,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                                             beta=group["momentum"], beta2=group["beta2"],
                                             num_heads=num_heads, head_axis=head_axis)
                     target = fp32_accumulator(state, p)
-                    if group["weight_decay"] and had_grad:
-                        target.mul_(1 - group["lr"] * group["weight_decay"])
-                    target.add_(update.reshape(p.shape), alpha=-group["lr"])
+                    hyperball_step(target, update.reshape(p.shape), group["lr"], state, num_heads, head_axis)
                     if target is not p:
                         p.copy_(target)
             else:
