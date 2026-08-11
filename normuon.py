@@ -143,9 +143,25 @@ def hyperball_step(p, update, lr, state, num_heads=None, head_axis="row"):
     Weight decay is dropped rather than ignored: scaling W by c before a step of fixed norm and then
     renormalizing lands exactly where stepping with lr / c does, so under the projection decay is
     only a learning rate in disguise.
+
+    The unit is always the one normuon_update orthogonalized, which for a parameter of more than two
+    dimensions is not the whole tensor: a 3D expert bank is a BATCH of independent matrices there, so
+    it gets a radius each, while a 4D conv filter is a single matrix flattened to (out, in*k). One
+    radius over an expert bank would pin only the sum of squares across its experts, which is the
+    coupling the per-head split exists to remove, one axis over. A caller with no orthogonalized unit
+    to follow -- the Adam branch -- passes a flat view instead, one sphere per parameter.
+
+    A parameter whose norm is 0 has no sphere: every direction is the same point, and the projection
+    would pin it there for the whole run through a divide that never errors. Zero-initialized
+    parameters are common (a zero-centered norm's gain, any residual-branch output init), so this
+    refuses rather than freezing them silently.
     """
     if num_heads is None:
-        dims = tuple(range(p.ndim))
+        if p.ndim == 4:
+            assert p.is_contiguous(), "projecting a conv filter in place needs a viewable parameter"
+            update = update.reshape(p.size(0), -1)
+            p = p.view(p.size(0), -1)
+        dims = (0,) if p.ndim == 1 else (-2, -1)
     else:
         p, update, dims = split_heads(p, num_heads, head_axis), split_heads(update, num_heads, head_axis), (-2, -1)
 
@@ -155,6 +171,10 @@ def hyperball_step(p, update, lr, state, num_heads=None, head_axis="row"):
     radius = state.get("radius")
     if radius is None:
         radius = state["radius"] = p.norm(dim=dims, keepdim=True, dtype=torch.float32)
+        assert radius.gt(0).all(), (
+            "hyperball needs a nonzero weight norm to define a sphere; a zero-initialized parameter "
+            f"would be pinned at zero for the whole run (shape {tuple(p.shape)})"
+        )
     p.sub_(update * (lr * radius / norm(update)))
     p.mul_(radius / norm(p))
 
@@ -431,7 +451,17 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["betas"] = group.get("betas", (0.9, 0.95))
                 group["eps"] = group.get("eps", 1e-10)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_muon"}
+                # Opt-in, because it redefines lr for the group and not every parameter can take it:
+                # a zero-initialized one has no sphere at all (hyperball_step refuses), and the rate
+                # matching an Adam step differs by orders of magnitude between a matrix and a short
+                # 1-D parameter, so one group cannot hold both.
+                group["hyperball"] = group.get("hyperball", False)
+                assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_muon",
+                                             "hyperball"}
+                # Under the projection a decay is only a learning rate in disguise, so a value here
+                # would silently do nothing rather than what it says.
+                assert not (group["hyperball"] and group["weight_decay"]), \
+                    "a hyperball group cannot carry weight decay; the projection absorbs it into lr"
         super().__init__(param_groups, dict())
 
     def load_state_dict(self, state_dict):
@@ -478,9 +508,15 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                     update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
                                          state["step"], group["betas"], group["eps"])
                     target = fp32_accumulator(state, p)
-                    if group["weight_decay"] and had_grad:
-                        target.mul_(1 - group["lr"] * group["weight_decay"])
-                    target.add_(update, alpha=-group["lr"])
+                    if group["hyperball"]:
+                        # One sphere per parameter, via a flat view: nothing orthogonalized these, so
+                        # there is no block structure for a radius to follow. lr is a radius fraction
+                        # here too, so it is NOT the additive branch's rate.
+                        hyperball_step(target.view(-1), update.reshape(-1), group["lr"], state)
+                    else:
+                        if group["weight_decay"] and had_grad:
+                            target.mul_(1 - group["lr"] * group["weight_decay"])
+                        target.add_(update, alpha=-group["lr"])
                     if target is not p:
                         p.copy_(target)
 
