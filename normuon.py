@@ -54,7 +54,9 @@ def zeropower_via_polar_express(G, steps=8):
 
     if should_transpose:
         X = X.mT
-    return torch.nan_to_num(X)
+    # inf must clear to zero, not to the dtype max: the caller squares this into second_momentum,
+    # where a huge finite entry overflows and latches the buffer at inf for the rest of the run.
+    return torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 # copied from https://github.com/KellerJordan/Muon/blob/master/muon.py
@@ -210,7 +212,10 @@ def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_st
     # With the heads split, dim=(-2,-1) spans one head, so the norm restoration below is per-head.
     vnorm = update.norm(dim=(-2,-1), keepdim=True)
     v_mean = torch.mean(update * update, dim=-1, keepdim=True)
-    second_momentum.lerp_(v_mean, 1 - beta2)
+    # A row of zeros is a cleared or absent update, not a measurement of one, so the second moment
+    # holds there: decayed toward zero it would leave a step size that overflows on the next real
+    # update, which is the same NaN the polar express clamp above exists to prevent.
+    second_momentum.lerp_(torch.where(v_mean > 0, v_mean, second_momentum), 1 - beta2)
     step_size = 1 / second_momentum.sqrt().add_(1e-10)
     update.mul_(step_size)
     vnorm_new = update.norm(dim=(-2,-1), keepdim=True)
@@ -430,6 +435,89 @@ def restore_fp32_state(optimizer, state_dict):
                 optimizer.state[p][key] = value.detach().clone().to(device=p.device)
 
 
+def failures(checks, labels):
+    """The labels whose check came back false, read in one synchronization."""
+    if not checks:
+        return []
+    return [label for label, ok in zip(labels, torch.stack(checks).tolist()) if not ok]
+
+
+def same_bits(a, b):
+    """Whether two tensors are identical bit for bit, NaN included."""
+    return (a.contiguous().view(torch.uint8) == b.contiguous().view(torch.uint8)).all()
+
+
+def assert_parameters_intact(pairs):
+    """Between steps a parameter must still equal the accumulator it was written from, rounded.
+
+    Nothing but this optimizer writes either one, so a difference is a stray write from elsewhere on the
+    device, and it is caught whatever value that write left behind, where testing for a NaN would see
+    only the few whose bit pattern happens to form one. Read in one go, so this costs one
+    synchronization; parameters already held in fp32 have no accumulator and are skipped.
+
+    Bit for bit rather than by value, because a NaN is not equal to itself: comparing by value reports
+    every parameter that already holds one as freshly written from outside, which is the opposite of
+    what happened and the reading a resume from a spoilt checkpoint would get.
+    """
+    checked = [(p, state["master"]) for p, state in pairs if "master" in state]
+    bad = [str(tuple(p.shape)) for p, _ in
+           failures([same_bits(master.to(p.dtype), p) for p, master in checked], checked)]
+    assert not bad, (
+        "a parameter no longer matches the accumulator it was written from, so something outside the "
+        f"optimizer wrote to it: {', '.join(bad)}"
+    )
+
+
+def assert_parameters_finite(pairs):
+    """Refuse to return from a step that wrote a non-finite parameter.
+
+    Such a weight is invisible until the next forward, and a trainer watching gradients never sees it
+    at all, so the step that wrote it is the only place that can name it. Naming the state that is also
+    non-finite is what separates an arithmetic fault from a corrupted buffer, since the radius is
+    written once at the first step and never again.
+    """
+    bad = []
+    for p, state in failures([torch.isfinite(p).all() for p, _ in pairs], pairs):
+        spoilt = [k for k, v in state.items() if torch.is_tensor(v) and not torch.isfinite(v).all()]
+        bad.append(f"{tuple(p.shape)} alongside non-finite {spoilt or ['nothing: its own state is clean']}")
+    assert not bad, "the optimizer step wrote non-finite parameters: " + "; ".join(bad)
+
+
+def assert_state_usable(pairs):
+    """Refuse to enter a step whose small long-lived state is already spoilt.
+
+    The ordering carries the diagnosis: assert_parameters_finite names a spoilt buffer only after the
+    step has written a parameter from it, which cannot say whether that buffer was poisoned between
+    steps or by the arithmetic that just ran. Firing here means the former, since a step reads these
+    before it writes them.
+
+    Non-negative as well as finite for the second moment, since it is an average of squares. A negative
+    one reaches the parameter as a NaN through the second moment's sqrt while the buffer itself reads
+    finite, so the later test would name only the accumulator and blame the wrong tensor.
+
+    Small state only. The momentum buffer and the accumulator are each the size of the model, and a
+    write to the accumulator already shows up as a parameter that no longer matches it. A poisoned
+    momentum is the gap this leaves: the orthogonalization scrubs it, so it never reaches a parameter
+    and nothing here would see it.
+    """
+    checks, labels = [], []
+    for p, state in pairs:
+        for key in ("second_momentum_buffer", "radius"):
+            value = state.get(key)
+            if value is None:
+                continue
+            usable = torch.isfinite(value).all()
+            if key == "second_momentum_buffer":
+                usable = usable & value.ge(0).all()
+            checks.append(usable)
+            labels.append((key, p))
+    bad = [f"{key} of {tuple(p.shape)}" for key, p in failures(checks, labels)]
+    assert not bad, (
+        "optimizer state was already spoilt when this step read it, so nothing in the step produced "
+        f"it: {', '.join(bad)}"
+    )
+
+
 class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
     """
     Non-distributed counterpart to NorMuonWithAuxAdam.
@@ -446,6 +534,8 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["head_axis"] = group.get("head_axis", "row")
                 assert set(group.keys()) == {"params", "lr", "momentum", "beta2", "weight_decay", "use_muon",
                                              "num_heads", "head_axis"}
+                assert not group["weight_decay"], \
+                    "a Muon group cannot carry weight decay; the hyperball projection absorbs it into lr"
             else:
                 group["lr"] = group.get("lr", 3e-4)
                 group["betas"] = group.get("betas", (0.9, 0.95))
@@ -475,6 +565,11 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        # Before the step overwrites the parameters, so this sees what happened while the model ran.
+        pairs = [(p, self.state[p]) for group in self.param_groups for p in group["params"]]
+        assert_parameters_intact(pairs)
+        assert_state_usable(pairs)
 
         for group in self.param_groups:
             if group["use_muon"]:
@@ -520,4 +615,5 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                     if target is not p:
                         p.copy_(target)
 
+        assert_parameters_finite(pairs)
         return loss
